@@ -66,6 +66,8 @@ DIRECT_MCP_CHARS = 40_000
 MAX_TOOLS = 128
 KEEP_RECENT_RESULTS = 12
 FINISH_MARGIN_SEC = 180
+VERIFY_ROUNDS = int(os.environ.get("VERIFY_ROUNDS", "2"))
+MIN_VERIFY_SEC = int(os.environ.get("MIN_VERIFY_SEC", "300"))
 RETRY_WAITS = (5, 15, 30, 60, 120)
 # How endpoints word an error saying the conversation no longer fits (xAI's:
 # "maximum prompt length is N but the request contains M tokens"). OpenAI's
@@ -129,22 +131,49 @@ client = openai.AsyncOpenAI(
     timeout=900,
 )
 
-SYSTEM = """You are an expert engineer working on a task in a Linux container. Your tools act inside it: bash (it \
-starts in {workdir}), read_file, write_file and edit_file. The container has no internet access.{mcp}
+SYSTEM = """You are a senior licensed professional engineer (PE) working in a Linux container. Your tools act inside it: \
+bash (starts in {workdir}), read_file, write_file, and edit_file. The container has no internet access.{mcp}
 
-How to work:
-- Read the whole task, then look at the files you were given before choosing an approach.
-- Work in small, verified steps. Compute numbers with code rather than by hand, and check units.
-- When the task says how the result is checked (a time limit, a format, a test), check it that way yourself.
-- Write each deliverable exactly where, under the name and in the format the task asks for. Write it early, then \
-improve it.
-- Produce office and binary formats (docx, xlsx, pdf, ...) with code, such as python3 and the libraries in the \
-container, so they are real files of that format.
-- Before you finish, open every deliverable again and check that it is complete and readable.
-- You have about {minutes} minutes in total; the time left is shown after the results of your tools.
+Follow this disciplined engineering workflow:
+1. RECONNAISSANCE FIRST: Read the entire prompt and inspect the full workspace directory tree, reference documents, \
+drawings, spreadsheets, CAD/IFC files, specs, and any MCP servers (email, documents, spreadsheets, CAD) before \
+choosing an approach. List every required deliverable path, filename, and exact format.
+2. SEPARATE HARD CONSTRAINTS FROM OBJECTIVES: Identify every governing code, safety factor, geometric/clash limit, \
+boundary condition, and acceptance criterion (breaking any hard constraint heavily penalizes the score). Then \
+identify the design objective (cost, weight, loss, accuracy, or rubric completeness) and optimize it rather than \
+stopping at the first rough guess.
+3. CODE-BACKED ENGINEERING MATH: Never do calculations in your head. Write and run Python scripts (using numpy, \
+scipy, pandas, ifcopenshell, etc. available in the container) with explicit units, equilibrium/conservation checks, \
+and parameter sweeps where optimization applies. Do not leave scratch files inside deliverable directories.
+4. REAL DELIVERABLES AT EXACT PATHS: Generate office/binary/archive deliverables (docx, xlsx, pdf, ifc, zip) using \
+real Python libraries, never hand-crafted placeholders. Write deliverables early and iterate to improve them.
+5. VERIFY BEFORE FINISHING: Re-open and test every deliverable at its exact target path (syntax/execution checks on \
+scripts, zipfile integrity, re-reading generated docx/xlsx/pdf/ifc content, verifying units and constraints).
+- You have about {minutes} minutes in total; the time left is shown after tool results.
 
-When the work is done, answer without calling a tool: a short summary of what you delivered (the path of each file) \
-and the key results. That answer is graded together with your files."""
+When the work is done, answer without calling a tool: a concise, accurate summary of every deliverable path, the \
+governing checks/constraints verified, and the key quantitative results. That answer is graded with your files."""
+
+VERIFIER_SYSTEM = """You are an adversarial Engineer-of-Record (EoR) and independent QA/QC reviewer. You are \
+inspecting the deliverables produced by another engineer in a Linux container (working directory: {workdir}).{mcp}
+
+Your ONLY job is to find real, concrete defects before final submission. You have read-only tools (bash, read_file) \
+to inspect files and run verification commands—do NOT modify any deliverable files.
+
+Check every one of these systematically:
+1. DELIVERABLE PATHS & FORMATS: Does every deliverable requested in the task instruction exist at the EXACT path, \
+filename, and format (e.g. .py, .zip, .ifc, .docx, .xlsx, .pdf)? Is each file non-empty and uncorrupted?
+2. EXECUTABILITY & INTEGRITY: If deliverables include code (e.g. solution.py), does it run cleanly without syntax or \
+runtime errors? If a .zip is required, test it with zipfile/unzip -t and check its internal directory structure. If \
+.docx/.xlsx/.pdf/.ifc is required, open it with Python and verify its contents, tables, formulas, and sections.
+3. HARD CONSTRAINTS & UNITS: Independently check the numbers, units, load combinations, safety factors, geometry/clash \
+clearances, and governing code requirements against the source project files.
+4. COMPLETENESS & OBJECTIVE QUALITY: Were all questions/items answered, all required sections/calculations included, \
+and was the design objective actually optimized (not left as an unoptimized baseline)?
+
+Reply with EXACTLY one of:
+- `VERDICT: PASS` (only if you verified every deliverable on disk and found zero defects), OR
+- `VERDICT: FAIL` followed by a concise numbered list of concrete, actionable defects with exact file paths and values."""
 
 MCP_DIRECT = """
 
@@ -156,9 +185,13 @@ The task also offers its own tools, listed below by server. Call mcp_find to see
 to run it.
 {catalog}"""
 
-SUMMARY_PROMPT = """The conversation is getting long, so the earlier turns will be removed. Write notes that let you \
-continue without them: what the task requires, what you found in the files, every file you created or changed (with \
-its path and state), the numbers and decisions so far, and what remains to do. Be specific."""
+SUMMARY_PROMPT = """The conversation is getting long, so earlier turns will be removed. Write dense, factual \
+engineering notes so you can continue without losing any detail:
+1. Exact deliverable paths, filenames, and formats required by the prompt.
+2. All hard constraints, governing codes, boundary conditions, and units discovered in the project files.
+3. Key computed numbers, design parameters, and decisions made so far (with units).
+4. Every file created or modified (exact path and current state).
+5. What has been verified vs. what remains to be done or fixed."""
 
 
 def tool(
@@ -846,20 +879,68 @@ class Agent:
         },
         {"role": "user", "content": self.session.instruction},
     ]
+    return await self._loop()
+
+  async def continue_with(self, feedback: str) -> str:
+    """Continues the conversation with verifier feedback for a fix round."""
+    self.messages.append({"role": "user", "content": feedback})
+    return await self._loop()
+
+  async def _execute_calls(
+      self,
+      calls: list[dict[str, Any]],
+      arguments: list[dict[str, Any] | str],
+  ) -> list[str]:
+    """Executes tool calls, running pure read_file batches concurrently."""
+    if len(calls) > 1 and all(
+        c["name"] == "read_file" and isinstance(a, dict)
+        for c, a in zip(calls, arguments)
+    ):
+      return list(
+          await asyncio.gather(*(
+              self.run_tool(c["name"], a) for c, a in zip(calls, arguments)
+          ))
+      )
+    results = []
+    for call, args in zip(calls, arguments):
+      results.append(
+          await self.run_tool(call["name"], args)
+          if isinstance(args, dict)
+          else args
+      )
+    return results
+
+  async def _loop(
+      self,
+      update_final_message: bool = True,
+      stop_at_remaining_sec: float | None = None,
+  ) -> str:
+    """Runs the core tool-calling loop until completion or deadline."""
+    margin = (
+        stop_at_remaining_sec
+        if stop_at_remaining_sec is not None
+        else self.finish_margin
+    )
     # head: the text of an answer cut off at the output limit
     nudges, head = 0, ""
     while True:
       left = self.session.time_left()
-      if left is not None and left < self.finish_margin:
+      if left is not None and left < margin:
+        if not update_final_message:
+          return "VERDICT: PASS"
         return await self.finish("Time is almost up.")
       try:
         reply = await self.complete(head=head)
       except OutOfTime:
+        if not update_final_message:
+          return "VERDICT: PASS"
         return await self.finish(
             "Time is almost up, and the model is not answering."
         )
       # what it streamed is the answer if the summary call fails too
       except CutOff:
+        if not update_final_message:
+          return "VERDICT: PASS"
         return await self.finish("Time is almost up.")
       arguments = [parse_arguments(call) for call in reply.calls.values()]
       if reply.text or reply.calls:
@@ -868,7 +949,7 @@ class Agent:
         # message with null content and no tool calls.
         self.messages.append(reply.message())
       text = visible(head + reply.text)
-      if text:
+      if text and update_final_message:
         self.session.final_message = text
       if not reply.calls:
         if visible(reply.text) and reply.finish == "length":
@@ -885,7 +966,7 @@ class Agent:
           })
           continue
         if visible(reply.text) or nudges >= 2:
-          return text or self.session.final_message
+          return text or (self.session.final_message if update_final_message else "")
         nudges += 1  # only consecutive empty turns end the run
         self.messages.append({
             "role": "user",
@@ -896,12 +977,9 @@ class Agent:
         })
         continue
       nudges, head = 0, ""
-      for call, args in zip(reply.calls.values(), arguments):
-        result = (
-            await self.run_tool(call["name"], args)
-            if isinstance(args, dict)
-            else args
-        )
+      calls_list = list(reply.calls.values())
+      results = await self._execute_calls(calls_list, arguments)
+      for call, args, result in zip(calls_list, arguments, results):
         if reply.finish == "length" and isinstance(args, str):
           result += (
               f" Your reply hit the {self.max_output}-token output limit; write"
@@ -1779,21 +1857,98 @@ class Agent:
     return True
 
 
+def parse_verdict(text: str) -> tuple[bool, str]:
+  """Parses the verifier's output into `(passed, critique)`."""
+  upper = text.upper()
+  if "VERDICT: FAIL" in upper:
+    return False, text
+  if "VERDICT: PASS" in upper:
+    return True, text
+  return False, text
+
+
+async def verify_once(
+    worker: Agent, summary: str, stop_at_remaining_sec: float
+) -> tuple[bool, str]:
+  """Runs an independent read-only verifier against the worker's deliverables."""
+  verifier = Agent(worker.session)
+  verifier.mcp = worker.mcp
+  verifier.tools = [
+      t
+      for t in worker.tools
+      if t["function"]["name"] not in ("write_file", "edit_file")
+  ]
+  verifier.finish_margin = stop_at_remaining_sec
+  verifier.messages = [
+      {
+          "role": "system",
+          "content": VERIFIER_SYSTEM.format(
+              workdir=worker.session.workdir,
+              mcp="",
+          ),
+      },
+      {
+          "role": "user",
+          "content": (
+              "## Original Task Instruction\n"
+              f"{worker.session.instruction}\n\n"
+              "## Engineer's Summary\n"
+              f"{summary}\n\n"
+              "Independently inspect the deliverables on disk, run checks, and"
+              " report `VERDICT: PASS` or `VERDICT: FAIL` with exact defects."
+          ),
+      },
+  ]
+  verdict_text = await verifier._loop(
+      update_final_message=False,
+      stop_at_remaining_sec=stop_at_remaining_sec,
+  )
+  return parse_verdict(verdict_text)
+
+
 async def solve(session: taskbridge.Session) -> str:
-  """Runs `Agent` on `session` and returns the final answer.
+  """Runs the worker agent followed by independent verify-and-fix rounds.
 
   Args:
     session: Active task session.
 
   Returns:
-    The final summary string returned by the agent.
+    The final summary string returned by the worker agent.
   """
   print(
       f"task: workdir {session.workdir}, model {MODEL},"
       f" {len(session.mcp_servers)} MCP server(s)",
       file=sys.stderr,
   )
-  return await Agent(session).run()
+  worker = Agent(session)
+  summary = await worker.run()
+  for round_idx in range(VERIFY_ROUNDS):
+    left = session.time_left()
+    if left is not None and left < max(MIN_VERIFY_SEC, worker.finish_margin + 120):
+      break
+    verifier_budget = 900.0 if left is None else min(900.0, left * 0.25)
+    stop_at = 0.0 if left is None else max(worker.finish_margin + 90, left - verifier_budget)
+    await session.log(f"verifier: starting QA round {round_idx + 1}")
+    try:
+      passed, critique = await verify_once(worker, summary, stop_at)
+    except Exception as exc:  # noqa: BLE001
+      await session.log(f"verifier: skipped after error ({exc})")
+      break
+    if passed:
+      await session.log(f"verifier: round {round_idx + 1} PASSED")
+      break
+    await session.log(f"verifier: round {round_idx + 1} found defects, fixing")
+    left = session.time_left()
+    if left is not None and left < worker.finish_margin + 60:
+      break
+    summary = await worker.continue_with(
+        "An independent QA/QC reviewer inspected your deliverables and found"
+        " these defects:\n\n"
+        f"{critique}\n\n"
+        "Fix every defect above, re-verify your deliverables on disk, and"
+        " provide an updated final summary."
+    )
+  return summary or session.final_message
 
 
 if __name__ == "__main__":
